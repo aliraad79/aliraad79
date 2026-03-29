@@ -1,0 +1,86 @@
+name: Download RPM Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'YouTube video URL to download'
+        required: true
+
+jobs:
+  download-video:
+    runs-on: ubuntu-latest
+    services:
+      pot-provider:
+        image: brainicism/bgutil-ytdlp-pot-provider
+        ports:
+          - 4416:4416
+
+    steps:
+      - name: Setup deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install yt-dlp and plugin
+        run: |
+          pip install yt-dlp bgutil-ytdlp-pot-provider
+
+      - name: Wait for PO token server
+        run: |
+          echo "Waiting for PO token server on port 4416..."
+          for i in $(seq 1 30); do
+            if curl -s http://localhost:4416/ > /dev/null 2>&1; then
+              echo "PO token server is ready!"
+              break
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 2
+          done
+          echo "Testing PO token server..."
+          curl -sv http://localhost:4416/ 2>&1 | head -20
+
+      - name: Download video
+        run: |
+          set +e
+          echo "Downloading with PO token provider..."
+          yt-dlp --js-runtimes deno \
+            -f "bestvideo[height<=720]+bestaudio/best[height<=720]/best" \
+            --merge-output-format mp4 \
+            -o "rpm_video.mp4" \
+            -v \
+            "${{ inputs.video_url }}" 2>&1
+
+          if [ -f rpm_video.mp4 ] && [ "$(stat -c%s rpm_video.mp4 2>/dev/null)" -gt 100000 ]; then
+            echo "SUCCESS!"
+            ls -lh rpm_video.mp4
+            exit 0
+          fi
+
+          echo "First attempt failed, trying with explicit extractor args..."
+          yt-dlp --js-runtimes deno \
+            --extractor-args "youtubepot-bgutilhttp:base_url=http://localhost:4416" \
+            --extractor-args "youtube:player_client=web" \
+            -f "bestvideo[height<=720]+bestaudio/best[height<=720]/best" \
+            --merge-output-format mp4 \
+            -o "rpm_video.mp4" \
+            -v \
+            "${{ inputs.video_url }}" 2>&1
+
+          if [ -f rpm_video.mp4 ] && [ "$(stat -c%s rpm_video.mp4 2>/dev/null)" -gt 100000 ]; then
+            echo "SUCCESS!"
+            ls -lh rpm_video.mp4
+            exit 0
+          fi
+
+          echo "FAILED"
+          exit 1
+
+      - name: Upload as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-video
+          path: rpm_video.mp4
+          retention-days: 1
+          if-no-files-found: ignore
