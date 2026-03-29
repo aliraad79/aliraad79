@@ -24,80 +24,33 @@ jobs:
   download-video:
     if: inputs.video_url != ''
     runs-on: ubuntu-latest
-    services:
-      cobalt:
-        image: ghcr.io/imputnet/cobalt:latest
-        ports:
-          - 9000:9000
-        env:
-          API_URL: "http://localhost:9000"
     steps:
-      - name: Wait for cobalt to start
+      - name: Setup deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install yt-dlp
+        run: pip install yt-dlp
+
+      - name: Write cookies file
         run: |
-          echo "Waiting for cobalt..."
-          for i in $(seq 1 30); do
-            if curl -s http://localhost:9000/ > /dev/null 2>&1; then
-              echo "Cobalt is ready!"
-              break
-            fi
-            echo "Waiting... ($i)"
-            sleep 2
-          done
+          echo "${{ secrets.YT_COOKIES }}" > cookies.txt
+          echo "Cookie lines: $(wc -l < cookies.txt)"
 
-      - name: Download via cobalt
+      - name: Download video
         run: |
-          set +e
-          VIDEO_URL="${{ inputs.video_url }}"
+          yt-dlp --js-runtimes deno \
+            --cookies cookies.txt \
+            -f "bestvideo[height<=720]+bestaudio/best[height<=720]/best" \
+            --merge-output-format mp4 \
+            -o "rpm_video.mp4" \
+            "${{ inputs.video_url }}"
+          ls -lh rpm_video.mp4
 
-          echo "=== Trying Cobalt local instance ==="
-          RESPONSE=$(curl -s -X POST http://localhost:9000/ \
-            -H "Content-Type: application/json" \
-            -H "Accept: application/json" \
-            -d "{\"url\":\"$VIDEO_URL\",\"videoQuality\":\"720\"}")
-          echo "Cobalt response: $RESPONSE"
-
-          DOWNLOAD_URL=$(echo "$RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null)
-
-          if [ -n "$DOWNLOAD_URL" ] && [ "$DOWNLOAD_URL" != "" ]; then
-            echo "Got download URL, fetching video..."
-            curl -L --max-time 600 -o rpm_video.mp4 "$DOWNLOAD_URL"
-            if [ -f rpm_video.mp4 ] && [ -s rpm_video.mp4 ]; then
-              SIZE=$(stat -c%s rpm_video.mp4)
-              echo "Downloaded $SIZE bytes"
-              if [ "$SIZE" -gt 10000 ]; then
-                echo "SUCCESS!"
-                ls -lh rpm_video.mp4
-                exit 0
-              fi
-            fi
-          fi
-
-          # Try the tunnel/stream endpoint
-          echo "=== Trying Cobalt tunnel ==="
-          RESPONSE2=$(curl -s -X POST http://localhost:9000/ \
-            -H "Content-Type: application/json" \
-            -H "Accept: application/json" \
-            -d "{\"url\":\"$VIDEO_URL\",\"videoQuality\":\"480\"}")
-          echo "Cobalt response 2: $RESPONSE2"
-
-          DOWNLOAD_URL2=$(echo "$RESPONSE2" | python3 -c "
-          import json,sys
-          d=json.load(sys.stdin)
-          url = d.get('url','') or d.get('stream','') or d.get('tunnel','')
-          print(url)
-          " 2>/dev/null)
-
-          if [ -n "$DOWNLOAD_URL2" ] && [ "$DOWNLOAD_URL2" != "" ]; then
-            curl -L --max-time 600 -o rpm_video.mp4 "$DOWNLOAD_URL2"
-            if [ -f rpm_video.mp4 ] && [ -s rpm_video.mp4 ]; then
-              echo "SUCCESS with tunnel!"
-              ls -lh rpm_video.mp4
-              exit 0
-            fi
-          fi
-
-          echo "Cobalt failed"
-          exit 1
+      - name: Cleanup cookies
+        if: always()
+        run: rm -f cookies.txt
 
       - name: Upload as artifact
         if: always()
