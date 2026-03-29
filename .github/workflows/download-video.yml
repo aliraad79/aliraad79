@@ -30,16 +30,60 @@ jobs:
         with:
           deno-version: v2.x
 
-      - name: Install yt-dlp
-        run: pip install yt-dlp
-
-      - name: Download video
+      - name: Install yt-dlp and generate PO token
         run: |
-          yt-dlp --js-runtimes deno -f "bestvideo[height<=720]+bestaudio/best[height<=720]" --merge-output-format mp4 -o "rpm_video.mp4" --extractor-args "youtube:player_client=web,mweb,android" --no-check-certificates --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" "${{ inputs.video_url }}"
+          pip install yt-dlp
+          pip install bgutil-ytdlp-pot-provider
+          echo "Generating PO token..."
+
+      - name: Download video with PO token provider
+        run: |
+          yt-dlp --js-runtimes deno \
+            -f "bestvideo[height<=720]+bestaudio/best[height<=720]" \
+            --merge-output-format mp4 \
+            -o "rpm_video.mp4" \
+            --extractor-args "youtube:player_client=web" \
+            --use-pot-provider \
+            "${{ inputs.video_url }}"
+
+      - name: Fallback - try with piped.video proxy
+        if: failure()
+        run: |
+          VIDEO_ID=$(echo "${{ inputs.video_url }}" | grep -oP 'v=\K[^&]+')
+          pip install yt-dlp
+          # Try Invidious/Piped instances as proxy
+          for INSTANCE in "https://pipedapi.kavin.rocks" "https://pipedapi.adminforge.de"; do
+            echo "Trying $INSTANCE..."
+            STREAM_URL=$(curl -s "$INSTANCE/streams/$VIDEO_ID" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          streams = data.get('videoStreams', [])
+          # Get best 720p or lower mp4 stream
+          best = None
+          for s in streams:
+              if s.get('videoOnly', True) == False and s.get('quality','') in ['720p','480p','360p']:
+                  best = s
+                  break
+          if not best and streams:
+              best = streams[0]
+          if best:
+              print(best['url'])
+          " 2>/dev/null)
+            if [ -n "$STREAM_URL" ]; then
+              echo "Found stream, downloading..."
+              curl -L -o rpm_video.mp4 "$STREAM_URL"
+              if [ -f rpm_video.mp4 ] && [ -s rpm_video.mp4 ]; then
+                echo "Download successful!"
+                break
+              fi
+            fi
+          done
 
       - name: Upload as artifact
+        if: success() || failure()
         uses: actions/upload-artifact@v4
         with:
           name: rpm-video
           path: rpm_video.mp4
           retention-days: 1
+          if-no-files-found: ignore
