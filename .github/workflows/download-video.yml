@@ -27,6 +27,7 @@ jobs:
     steps:
       - name: Download from Invidious/Piped instances
         run: |
+          set +e
           VIDEO_ID=$(echo "${{ inputs.video_url }}" | grep -oP 'v=\K[^&]+' || echo "${{ inputs.video_url }}")
           echo "Video ID: $VIDEO_ID"
 
