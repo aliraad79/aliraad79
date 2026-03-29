@@ -30,57 +30,86 @@ jobs:
         with:
           deno-version: v2.x
 
-      - name: Install yt-dlp and generate PO token
+      - name: Install tools
         run: |
-          pip install yt-dlp
-          pip install bgutil-ytdlp-pot-provider
-          echo "Generating PO token..."
+          pip install yt-dlp bgutil-ytdlp-pot-provider
+          sudo apt-get update && sudo apt-get install -y chromium-browser
 
-      - name: Download video with PO token provider
+      - name: Generate PO token with bgutil
         run: |
+          python3 -c "
+          from bgutil_ytdlp_pot_provider import get_po_token
+          token = get_po_token()
+          print(f'PO_TOKEN={token}')
+          " > /tmp/pot.env 2>/dev/null || echo "PO token generation failed, will try without"
+          cat /tmp/pot.env 2>/dev/null || true
+
+      - name: Download with yt-dlp (multiple strategies)
+        run: |
+          set +e
+          VIDEO_URL="${{ inputs.video_url }}"
+
+          # Strategy 1: yt-dlp with pot provider plugin
+          echo "=== Strategy 1: yt-dlp with POT provider ==="
           yt-dlp --js-runtimes deno \
-            -f "bestvideo[height<=720]+bestaudio/best[height<=720]" \
+            -f "bestvideo[height<=720]+bestaudio/best[height<=720]/best" \
             --merge-output-format mp4 \
             -o "rpm_video.mp4" \
-            --extractor-args "youtube:player_client=web" \
-            --use-pot-provider \
-            "${{ inputs.video_url }}"
+            --extractor-args "youtube:player_client=web_creator" \
+            "$VIDEO_URL" && exit 0
 
-      - name: Fallback - try with piped.video proxy
-        if: failure()
-        run: |
-          VIDEO_ID=$(echo "${{ inputs.video_url }}" | grep -oP 'v=\K[^&]+')
-          pip install yt-dlp
-          # Try Invidious/Piped instances as proxy
-          for INSTANCE in "https://pipedapi.kavin.rocks" "https://pipedapi.adminforge.de"; do
+          # Strategy 2: yt-dlp with tv client
+          echo "=== Strategy 2: yt-dlp with tv_embedded client ==="
+          yt-dlp --js-runtimes deno \
+            -f "bestvideo[height<=720]+bestaudio/best[height<=720]/best" \
+            --merge-output-format mp4 \
+            -o "rpm_video.mp4" \
+            --extractor-args "youtube:player_client=tv,tv_embedded" \
+            "$VIDEO_URL" && exit 0
+
+          # Strategy 3: cobalt API
+          echo "=== Strategy 3: Cobalt API ==="
+          VIDEO_ID=$(echo "$VIDEO_URL" | grep -oP 'v=\K[^&]+')
+          DOWNLOAD_URL=$(curl -s -X POST "https://api.cobalt.tools/" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -d "{\"url\":\"https://youtube.com/watch?v=$VIDEO_ID\",\"videoQuality\":\"720\"}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null)
+          if [ -n "$DOWNLOAD_URL" ] && [ "$DOWNLOAD_URL" != "" ]; then
+            curl -L -o rpm_video.mp4 "$DOWNLOAD_URL" && exit 0
+          fi
+          echo "Cobalt failed too"
+
+          # Strategy 4: Invidious API
+          echo "=== Strategy 4: Invidious instances ==="
+          for INSTANCE in "https://inv.nadeko.net" "https://invidious.nerdvpn.de" "https://iv.datura.network"; do
             echo "Trying $INSTANCE..."
-            STREAM_URL=$(curl -s "$INSTANCE/streams/$VIDEO_ID" | python3 -c "
-          import json, sys
-          data = json.load(sys.stdin)
-          streams = data.get('videoStreams', [])
-          # Get best 720p or lower mp4 stream
-          best = None
-          for s in streams:
-              if s.get('videoOnly', True) == False and s.get('quality','') in ['720p','480p','360p']:
-                  best = s
-                  break
-          if not best and streams:
-              best = streams[0]
-          if best:
-              print(best['url'])
+            STREAM=$(curl -s --max-time 10 "$INSTANCE/api/v1/videos/$VIDEO_ID" | python3 -c "
+          import json,sys
+          try:
+            d=json.load(sys.stdin)
+            for s in d.get('formatStreams',[]):
+              if '720' in s.get('qualityLabel','') or '480' in s.get('qualityLabel',''):
+                print(s['url']); break
+            else:
+              fs = d.get('formatStreams',[])
+              if fs: print(fs[-1]['url'])
+          except: pass
           " 2>/dev/null)
-            if [ -n "$STREAM_URL" ]; then
-              echo "Found stream, downloading..."
-              curl -L -o rpm_video.mp4 "$STREAM_URL"
+            if [ -n "$STREAM" ]; then
+              echo "Found stream from $INSTANCE"
+              curl -L --max-time 300 -o rpm_video.mp4 "$STREAM"
               if [ -f rpm_video.mp4 ] && [ -s rpm_video.mp4 ]; then
-                echo "Download successful!"
-                break
+                echo "Success!"
+                exit 0
               fi
             fi
           done
 
+          echo "All strategies failed"
+          exit 1
+
       - name: Upload as artifact
-        if: success() || failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rpm-video
