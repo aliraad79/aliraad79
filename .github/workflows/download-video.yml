@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: 'YouTube video URL to download (leave empty to just list videos)'
+        description: 'YouTube video URL or ID (leave empty to just list videos)'
         required: false
         default: ''
 
@@ -25,34 +25,202 @@ jobs:
     if: inputs.video_url != ''
     runs-on: ubuntu-latest
     steps:
-      - name: Setup deno
-        uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
-
-      - name: Install yt-dlp
-        run: pip install yt-dlp
-
-      - name: Write cookies file
+      - name: Download from Invidious/Piped instances
         run: |
-          echo "${{ secrets.YT_COOKIES }}" > cookies.txt
-          echo "Cookie lines: $(wc -l < cookies.txt)"
+          VIDEO_ID=$(echo "${{ inputs.video_url }}" | grep -oP 'v=\K[^&]+' || echo "${{ inputs.video_url }}")
+          echo "Video ID: $VIDEO_ID"
 
-      - name: Download video
-        run: |
-          yt-dlp --js-runtimes deno \
-            --cookies cookies.txt \
-            --extractor-args "youtube:player_client=web" \
-            -f "bestvideo[height<=720]+bestaudio/best[height<=720]/best" \
-            --merge-output-format mp4 \
-            -o "rpm_video.mp4" \
-            -v \
-            "${{ inputs.video_url }}"
-          ls -lh rpm_video.mp4
+          # Comprehensive list of Invidious instances
+          INVIDIOUS_INSTANCES=(
+            "https://yewtu.be"
+            "https://inv.nadeko.net"
+            "https://invidious.nerdvpn.de"
+            "https://invidious.materialio.us"
+            "https://invidious.privacyredirect.com"
+            "https://invidious.drgns.space"
+            "https://inv.tux.pizza"
+            "https://invidious.protokoll-11.de"
+            "https://invidious.fdn.fr"
+            "https://inv.in.projectsegfau.lt"
+            "https://invidious.perennialte.ch"
+            "https://yt.artemislena.eu"
+            "https://invidious.lunar.icu"
+            "https://vid.puffyan.us"
+          )
 
-      - name: Cleanup cookies
-        if: always()
-        run: rm -f cookies.txt
+          # Comprehensive list of Piped API instances
+          PIPED_INSTANCES=(
+            "https://pipedapi.kavin.rocks"
+            "https://pipedapi.adminforge.de"
+            "https://api.piped.yt"
+            "https://pipedapi.leptons.xyz"
+            "https://pipedapi.r4fo.com"
+            "https://pipedapi.moomoo.me"
+            "https://pipedapi.drgns.space"
+          )
+
+          echo "========================================="
+          echo "TRYING INVIDIOUS INSTANCES (API + curl)"
+          echo "========================================="
+          for INSTANCE in "${INVIDIOUS_INSTANCES[@]}"; do
+            echo ""
+            echo "--- $INSTANCE ---"
+            JSON=$(curl -s --max-time 15 "$INSTANCE/api/v1/videos/$VIDEO_ID" 2>/dev/null)
+            if [ -z "$JSON" ]; then
+              echo "  No response"
+              continue
+            fi
+
+            # Check for error
+            ERR=$(echo "$JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('error',''))" 2>/dev/null)
+            if [ -n "$ERR" ] && [ "$ERR" != "" ]; then
+              echo "  Error: $ERR"
+              continue
+            fi
+
+            TITLE=$(echo "$JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('title','unknown'))" 2>/dev/null)
+            echo "  Title: $TITLE"
+
+            # Get direct stream URL from formatStreams (combined audio+video)
+            STREAM_URL=$(echo "$JSON" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          fs = d.get('formatStreams',[])
+          # Prefer 720p, then 360p, then anything
+          for target in ['720p','480p','360p']:
+            for s in fs:
+              if target in s.get('qualityLabel',''):
+                print(s['url'])
+                sys.exit(0)
+          if fs:
+            print(fs[-1]['url'])
+          " 2>/dev/null)
+
+            if [ -z "$STREAM_URL" ]; then
+              echo "  No stream URL found"
+              # Try local proxy URL
+              STREAM_URL=$(echo "$JSON" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          fs = d.get('formatStreams',[])
+          for s in fs:
+            if 'url' in s:
+              print(s['url'])
+              sys.exit(0)
+          # Try adaptiveFormats
+          for s in d.get('adaptiveFormats',[]):
+            if 'video' in s.get('type','') and 'url' in s:
+              print(s['url'])
+              sys.exit(0)
+          " 2>/dev/null)
+              if [ -z "$STREAM_URL" ]; then
+                echo "  No URLs at all"
+                continue
+              fi
+            fi
+
+            echo "  Got stream URL, downloading..."
+            curl -L --max-time 600 \
+              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              -o rpm_video.mp4 "$STREAM_URL" 2>&1 | tail -3
+
+            if [ -f rpm_video.mp4 ]; then
+              SIZE=$(stat -c%s rpm_video.mp4 2>/dev/null || echo 0)
+              echo "  File size: $SIZE bytes"
+              if [ "$SIZE" -gt 100000 ]; then
+                echo "  SUCCESS from $INSTANCE!"
+                exit 0
+              else
+                echo "  File too small, trying next..."
+                rm -f rpm_video.mp4
+              fi
+            fi
+          done
+
+          echo ""
+          echo "========================================="
+          echo "TRYING PIPED API INSTANCES"
+          echo "========================================="
+          for API in "${PIPED_INSTANCES[@]}"; do
+            echo ""
+            echo "--- $API ---"
+            JSON=$(curl -s --max-time 15 "$API/streams/$VIDEO_ID" 2>/dev/null)
+            if [ -z "$JSON" ]; then
+              echo "  No response"
+              continue
+            fi
+
+            ERR=$(echo "$JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('error',''))" 2>/dev/null)
+            if [ -n "$ERR" ] && [ "$ERR" != "" ]; then
+              echo "  Error: $ERR"
+              continue
+            fi
+
+            TITLE=$(echo "$JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('title','unknown'))" 2>/dev/null)
+            echo "  Title: $TITLE"
+
+            # Get stream from videoStreams (non video-only) or audioStreams
+            STREAM_URL=$(echo "$JSON" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          # Prefer non-videoOnly streams (has audio+video)
+          for s in d.get('videoStreams',[]):
+            if not s.get('videoOnly',True) and s.get('quality','') in ['720p','480p','360p']:
+              print(s['url'])
+              sys.exit(0)
+          for s in d.get('videoStreams',[]):
+            if not s.get('videoOnly',True):
+              print(s['url'])
+              sys.exit(0)
+          " 2>/dev/null)
+
+            if [ -z "$STREAM_URL" ]; then
+              # Try proxy stream URL from piped
+              PROXY_URL=$(echo "$JSON" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          url = d.get('proxyUrl','') or d.get('thumbnailUrl','')
+          # Build proxy stream URL
+          for s in d.get('videoStreams',[]):
+            u = s.get('url','')
+            if u and not s.get('videoOnly',True):
+              print(u)
+              sys.exit(0)
+          for s in d.get('videoStreams',[]):
+            u = s.get('url','')
+            if u:
+              print(u)
+              sys.exit(0)
+          " 2>/dev/null)
+              STREAM_URL="$PROXY_URL"
+            fi
+
+            if [ -z "$STREAM_URL" ]; then
+              echo "  No usable stream URL"
+              continue
+            fi
+
+            echo "  Got stream URL, downloading..."
+            curl -L --max-time 600 \
+              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              -o rpm_video.mp4 "$STREAM_URL" 2>&1 | tail -3
+
+            if [ -f rpm_video.mp4 ]; then
+              SIZE=$(stat -c%s rpm_video.mp4 2>/dev/null || echo 0)
+              echo "  File size: $SIZE bytes"
+              if [ "$SIZE" -gt 100000 ]; then
+                echo "  SUCCESS from $API!"
+                exit 0
+              else
+                echo "  File too small, trying next..."
+                rm -f rpm_video.mp4
+              fi
+            fi
+          done
+
+          echo ""
+          echo "ALL INSTANCES FAILED"
+          exit 1
 
       - name: Upload as artifact
         if: always()
