@@ -1,0 +1,40 @@
+name: Download RPM Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'YouTube video URL to download (leave empty to just list videos)'
+        required: false
+        default: ''
+
+jobs:
+  list-videos:
+    if: inputs.video_url == ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install yt-dlp
+        run: pip install yt-dlp
+
+      - name: List recent videos
+        run: |
+          echo "=== Recent videos from Rocketpoweredmohawk ==="
+          yt-dlp --flat-playlist --playlist-end 20 --print "%(id)s | %(title)s | %(upload_date)s" "https://www.youtube.com/@rocketpoweredmohawk/videos"
+
+  download-video:
+    if: inputs.video_url != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install yt-dlp
+        run: pip install yt-dlp
+
+      - name: Download video
+        run: |
+          yt-dlp -f "bestvideo[height<=720]+bestaudio/best[height<=720]" --merge-output-format mp4 -o "rpm_video.mp4" "${{ inputs.video_url }}"
+
+      - name: Upload as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-video
+          path: rpm_video.mp4
+          retention-days: 1
