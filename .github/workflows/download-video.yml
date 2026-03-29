@@ -25,83 +25,114 @@ jobs:
     if: inputs.video_url != ''
     runs-on: ubuntu-latest
     steps:
-      - name: Setup deno
-        uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
-
       - name: Install tools
-        run: |
-          pip install yt-dlp bgutil-ytdlp-pot-provider
-          sudo apt-get update && sudo apt-get install -y chromium-browser
+        run: pip install yt-dlp
 
-      - name: Generate PO token with bgutil
-        run: |
-          python3 -c "
-          from bgutil_ytdlp_pot_provider import get_po_token
-          token = get_po_token()
-          print(f'PO_TOKEN={token}')
-          " > /tmp/pot.env 2>/dev/null || echo "PO token generation failed, will try without"
-          cat /tmp/pot.env 2>/dev/null || true
-
-      - name: Download with yt-dlp (multiple strategies)
+      - name: Download via alternative frontends
         run: |
           set +e
-          VIDEO_URL="${{ inputs.video_url }}"
+          VIDEO_ID=$(echo "${{ inputs.video_url }}" | grep -oP 'v=\K[^&]+')
+          echo "Video ID: $VIDEO_ID"
 
-          # Strategy 1: yt-dlp with pot provider plugin
-          echo "=== Strategy 1: yt-dlp with POT provider ==="
-          yt-dlp --js-runtimes deno \
-            -f "bestvideo[height<=720]+bestaudio/best[height<=720]/best" \
-            --merge-output-format mp4 \
-            -o "rpm_video.mp4" \
-            --extractor-args "youtube:player_client=web_creator" \
-            "$VIDEO_URL" && exit 0
+          # Try Invidious instances with yt-dlp
+          echo "=== Trying Invidious instances with yt-dlp ==="
+          for INSTANCE in "yewtu.be" "inv.nadeko.net" "invidious.nerdvpn.de" "iv.datura.network"; do
+            echo "--- Trying https://$INSTANCE/watch?v=$VIDEO_ID ---"
+            yt-dlp -f "bestvideo[height<=720]+bestaudio/best[height<=720]/best" \
+              --merge-output-format mp4 \
+              -o "rpm_video.mp4" \
+              "https://$INSTANCE/watch?v=$VIDEO_ID" 2>&1
+            if [ -f rpm_video.mp4 ] && [ -s rpm_video.mp4 ]; then
+              echo "SUCCESS with $INSTANCE via yt-dlp!"
+              exit 0
+            fi
+            rm -f rpm_video.mp4
+          done
 
-          # Strategy 2: yt-dlp with tv client
-          echo "=== Strategy 2: yt-dlp with tv_embedded client ==="
-          yt-dlp --js-runtimes deno \
-            -f "bestvideo[height<=720]+bestaudio/best[height<=720]/best" \
-            --merge-output-format mp4 \
-            -o "rpm_video.mp4" \
-            --extractor-args "youtube:player_client=tv,tv_embedded" \
-            "$VIDEO_URL" && exit 0
+          # Try Piped instances with yt-dlp
+          echo "=== Trying Piped instances with yt-dlp ==="
+          for INSTANCE in "piped.kavin.rocks" "piped.video" "piped.adminforge.de" "piped.leptons.xyz"; do
+            echo "--- Trying https://$INSTANCE/watch?v=$VIDEO_ID ---"
+            yt-dlp -f "bestvideo[height<=720]+bestaudio/best[height<=720]/best" \
+              --merge-output-format mp4 \
+              -o "rpm_video.mp4" \
+              "https://$INSTANCE/watch?v=$VIDEO_ID" 2>&1
+            if [ -f rpm_video.mp4 ] && [ -s rpm_video.mp4 ]; then
+              echo "SUCCESS with $INSTANCE via yt-dlp!"
+              exit 0
+            fi
+            rm -f rpm_video.mp4
+          done
 
-          # Strategy 3: cobalt API
-          echo "=== Strategy 3: Cobalt API ==="
-          VIDEO_ID=$(echo "$VIDEO_URL" | grep -oP 'v=\K[^&]+')
-          DOWNLOAD_URL=$(curl -s -X POST "https://api.cobalt.tools/" \
-            -H "Content-Type: application/json" \
-            -H "Accept: application/json" \
-            -d "{\"url\":\"https://youtube.com/watch?v=$VIDEO_ID\",\"videoQuality\":\"720\"}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null)
-          if [ -n "$DOWNLOAD_URL" ] && [ "$DOWNLOAD_URL" != "" ]; then
-            curl -L -o rpm_video.mp4 "$DOWNLOAD_URL" && exit 0
-          fi
-          echo "Cobalt failed too"
+          # Try Piped API direct download
+          echo "=== Trying Piped API direct stream download ==="
+          for API in "https://pipedapi.kavin.rocks" "https://pipedapi.adminforge.de" "https://api.piped.yt"; do
+            echo "--- Trying $API ---"
+            JSON=$(curl -s --max-time 15 "$API/streams/$VIDEO_ID")
+            if echo "$JSON" | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null; then
+              # Try to get a combined audio+video stream
+              STREAM_URL=$(echo "$JSON" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          # First try formatStreams (combined a+v)
+          for s in d.get('formatStreams',[]):
+            q = s.get('quality','')
+            if '720' in q or '480' in q or '360' in q:
+              print(s['url']); sys.exit(0)
+          fs = d.get('formatStreams',[])
+          if fs:
+            print(fs[-1]['url']); sys.exit(0)
+          # Fallback: videoStreams that are not videoOnly
+          for s in d.get('videoStreams',[]):
+            if not s.get('videoOnly',True):
+              print(s['url']); sys.exit(0)
+          " 2>/dev/null)
+              if [ -n "$STREAM_URL" ]; then
+                echo "Found stream URL, downloading..."
+                curl -L --max-time 600 -o rpm_video.mp4 "$STREAM_URL"
+                if [ -f rpm_video.mp4 ] && [ -s rpm_video.mp4 ]; then
+                  SIZE=$(stat -c%s rpm_video.mp4)
+                  echo "Downloaded $SIZE bytes"
+                  if [ "$SIZE" -gt 10000 ]; then
+                    echo "SUCCESS with $API!"
+                    exit 0
+                  fi
+                fi
+                rm -f rpm_video.mp4
+              fi
+            fi
+          done
 
-          # Strategy 4: Invidious API
-          echo "=== Strategy 4: Invidious instances ==="
-          for INSTANCE in "https://inv.nadeko.net" "https://invidious.nerdvpn.de" "https://iv.datura.network"; do
-            echo "Trying $INSTANCE..."
-            STREAM=$(curl -s --max-time 10 "$INSTANCE/api/v1/videos/$VIDEO_ID" | python3 -c "
+          # Try Invidious API direct download
+          echo "=== Trying Invidious API direct stream download ==="
+          for API in "https://inv.nadeko.net" "https://invidious.nerdvpn.de" "https://iv.datura.network" "https://yewtu.be"; do
+            echo "--- Trying $API ---"
+            JSON=$(curl -s --max-time 15 "$API/api/v1/videos/$VIDEO_ID")
+            STREAM_URL=$(echo "$JSON" | python3 -c "
           import json,sys
           try:
             d=json.load(sys.stdin)
             for s in d.get('formatStreams',[]):
-              if '720' in s.get('qualityLabel','') or '480' in s.get('qualityLabel',''):
-                print(s['url']); break
-            else:
-              fs = d.get('formatStreams',[])
-              if fs: print(fs[-1]['url'])
-          except: pass
+              q = s.get('qualityLabel','')
+              if '720' in q or '480' in q or '360' in q:
+                print(s['url']); sys.exit(0)
+            fs = d.get('formatStreams',[])
+            if fs: print(fs[-1]['url'])
+          except Exception as e:
+            print('',file=sys.stderr)
           " 2>/dev/null)
-            if [ -n "$STREAM" ]; then
-              echo "Found stream from $INSTANCE"
-              curl -L --max-time 300 -o rpm_video.mp4 "$STREAM"
+            if [ -n "$STREAM_URL" ]; then
+              echo "Found stream URL from $API, downloading..."
+              curl -L --max-time 600 -o rpm_video.mp4 "$STREAM_URL"
               if [ -f rpm_video.mp4 ] && [ -s rpm_video.mp4 ]; then
-                echo "Success!"
-                exit 0
+                SIZE=$(stat -c%s rpm_video.mp4)
+                echo "Downloaded $SIZE bytes"
+                if [ "$SIZE" -gt 10000 ]; then
+                  echo "SUCCESS with $API!"
+                  exit 0
+                fi
               fi
+              rm -f rpm_video.mp4
             fi
           done
 
